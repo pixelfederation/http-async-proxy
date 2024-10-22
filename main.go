@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 
@@ -182,6 +183,7 @@ func (p *ProxyServer) proxyRequest(r *http.Request) {
 	p.totalRequests.Inc()
 
 	host := r.Host // The front-facing host
+	host , _, _ = strings.Cut(host, ":") //strip port
 	backends, found := p.getBackendsForHost(host)
 
 	if !found || len(backends) == 0 {
