@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"strings"
 
 	"gopkg.in/yaml.v2"
 
@@ -182,8 +182,8 @@ func (p *ProxyServer) proxyRequest(r *http.Request) {
 	// Increment total requests counter
 	p.totalRequests.Inc()
 
-	host := r.Host // The front-facing host
-	host , _, _ = strings.Cut(host, ":") //strip port
+	host := r.Host                      // The front-facing host
+	host, _, _ = strings.Cut(host, ":") //strip port
 	backends, found := p.getBackendsForHost(host)
 
 	if !found || len(backends) == 0 {
@@ -272,7 +272,7 @@ func main() {
 	workerCount, _ := strconv.Atoi(getEnv("WORKER_COUNT", "5"))
 	listenAddress := getEnv("LISTEN_ADDRESS", ":8080")
 	metricsPort := getEnv("METRICS_PORT", ":9091")
-	configPath  := getEnv("CONFIG_PATH", "/etc/backends.yaml")
+	configPath := getEnv("CONFIG_PATH", "/etc/backends.yaml")
 
 	// Create a new proxy server with the path to the YAML config
 	proxy := NewProxyServer(configPath, queueSize, workerCount) // queue size = 100, worker count = 5
