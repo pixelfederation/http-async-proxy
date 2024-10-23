@@ -7,3 +7,7 @@ WORKER_COUNT: 5
 LISTEN_ADDRESS: 8080  
 METRICS_ADDRESS: 9091  
 CONFIG_PATH: /etc/backends.yaml
+
+
+#TODO 
+- pre-stop script to image, sig term handling
