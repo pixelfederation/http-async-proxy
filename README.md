@@ -1,12 +1,15 @@
 # http-async-proxy
 pod local async http proxy with buffer
 
-env configuraion variables with defaults:  
-QUEUE_SIZE: 100  
-WORKER_COUNT: 5  
-LISTEN_ADDRESS: 8080  
-METRICS_ADDRESS: 9091  
-CONFIG_PATH: /etc/backends.yaml
+# Options
+
+| Option          | Long Flag         | Short Flag | Environment Variable | Description                                    | Default Value      |
+|-----------------|-------------------|------------|----------------------|------------------------------------------------|--------------------|
+| Queue Size      | `--queue_size`    | `-q`       | `QUEUE_SIZE`         | Buffer queue size/number of buffered requests  | `100`              |
+| Worker Count    | `--worker_count`  | `-w`       | `WORKER_COUNT`       | Number of worker goroutines to spawn           | `5`                |
+| Listen Address  | `--listen`        | `-l`       | `LISTEN_ADDRESS`     | Listen bind address                            | `:8080`            |
+| Metrics Address | `--metrics_address` | `-m`      | `METRICS_ADDRESS`    | Metrics bind address                           | `:9091`            |
+| Config Path     | `--config_path`   | `-c`       | `CONFIG_PATH`        | Path to backend map file in YAML format        | `/etc/backends.yaml` |
 
 
 #TODO 
