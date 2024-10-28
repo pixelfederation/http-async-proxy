@@ -199,7 +199,6 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
     hostBackend = hostBackend+timeoutStr
 
     if client, found := p.clients.Load(hostBackend); found {
-        log.Printf("Reuse client for host: %s", hostBackend)
         return client.(*http.Client)
     }
     client := &http.Client{
@@ -221,7 +220,6 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
         },
     }
     p.clients.Store(hostBackend, client)
-    log.Printf("New client for host: %s", hostBackend)
     return client
 }
 
