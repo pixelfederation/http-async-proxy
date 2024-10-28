@@ -14,3 +14,4 @@ pod local async http proxy with buffer
 
 #TODO 
 - pre-stop script to image, sig term handling
+- final fallback after sig-term
