@@ -9,6 +9,8 @@ import (
     "net"
     "net/http"
     "os"
+    "syscall"
+    "os/signal"
     "sync"
     "time"
     "strings"
@@ -114,7 +116,32 @@ func NewProxyServer(configPath string, queueSize, workerCount int) *ProxyServer 
         go ps.worker(i)
     }
 
+    signalCh := make(chan os.Signal)
+    signal.Notify(signalCh, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+    go func() {
+        for sig := range signalCh {
+          switch sig {
+            case os.Interrupt:
+              log.Printf("Got interrput signal")
+            case syscall.SIGTERM:
+              log.Printf("Got SIGTERM signal")
+              // deliver rest of queue to FINAL destination
+            case syscall.SIGQUIT:
+              log.Printf("Got SIGQUIT signal")
+              // deliver rest of queue to FINAL destination
+            default:
+              log.Printf("Some signal received: %v\n", sig)
+          }
+          log.Printf("Queue len is: %v\n", ps.getQueueLen())
+       }
+    }()
+
     return ps
+}
+
+// loadConfig loads the configuration from the YAML file
+func (p *ProxyServer) getQueueLen() int {
+    return len(p.queue)
 }
 
 // loadConfig loads the configuration from the YAML file
