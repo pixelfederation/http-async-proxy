@@ -259,24 +259,33 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
 
 // proxyRequest forwards the request to the backend with retries based on the configuration
 func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
+    if r == nil || r.Req == nil {
+        klog.Error("Received a nil request, skipping processing")
+        return
+    }
 
-    host := r.Req.Host // The front-facing host
-    host , _, _ = strings.Cut(host, ":") //strip port
+    host := r.Req.Host
+    host, _, _ = strings.Cut(host, ":") // strip port
     backends, found := p.getBackendsForHost(host)
 
     p.totalRequests.WithLabelValues(host).Inc()
 
     if !found || len(backends) == 0 {
         p.totalFailed.WithLabelValues(host).Inc() // Increment failed request counter
-        klog.V(1).Infof("Error host: '%v' not found in config file, droping request", host)
+        klog.V(1).Infof("Error host: '%v' not found in config file, dropping request", host)
         return
     }
 
     var lastErr error
     for _, backend := range backends {
-        client := p.getClientForHost(host + backend.Backend, backend.Timeout)
+        client := p.getClientForHost(host+backend.Backend, backend.Timeout)
+        if client == nil {
+            klog.V(1).Infof("Client for backend %s is nil, skipping", backend.Backend)
+            continue
+        }
+
         for i := 0; i <= backend.Retries; i++ {
-            req, err := http.NewRequest(r.Req.Method, backend.Backend+r.Req.URL.Path, bytes.NewReader(r.Body));
+            req, err := http.NewRequest(r.Req.Method, backend.Backend+r.Req.URL.Path, bytes.NewReader(r.Body))
             if err != nil {
                 klog.V(4).Infof("Message failed for host %s with error: %v", backend.Backend, err)
                 lastErr = err
@@ -285,26 +294,32 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
 
             req.Header = r.Req.Header
             resp, err := client.Do(req)
-            // Read the response body to ensure the connection can be reused
-            if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-                klog.V(1).Infof("Failed to read %v response body: %v", backend.Backend +r.Req.URL.Path, err)
+            if err != nil {
+                klog.V(1).Infof("Failed to process request to %s with error: %v", backend.Backend, err)
+                lastErr = err
+                p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
+                time.Sleep(time.Duration(backend.Delay) * time.Second)
+                continue
             }
 
+            // Read and discard response body
+            if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+                klog.V(1).Infof("Failed to read response body from %v: %v", backend.Backend+r.Req.URL.Path, err)
+            }
             resp.Body.Close()
-            if err == nil && resp.StatusCode < 400 {
-                // Successfully forwarded request
+
+            if resp.StatusCode < 400 {
                 p.totalForwarded.WithLabelValues(host, backend.Backend).Inc()
+                klog.V(4).Infof("Request success to %s", backend.Backend)
                 return
             } else {
-                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v", backend.Backend, resp.StatusCode, err)
+                klog.V(4).Infof("Request to %s failed on not acceptable status code %v", backend.Backend, resp.StatusCode)
+                time.Sleep(time.Duration(backend.Delay) * time.Second)
+                continue
             }
-            lastErr = err
-            p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
-            time.Sleep(time.Duration(backend.Delay) * time.Second) // Small delay before retrying
         }
     }
 
-    // If we get here, all backends failed
     p.totalFailed.WithLabelValues(host).Inc()
     klog.V(1).Infof("All backends failed for host %s: %v", host, lastErr)
 }
