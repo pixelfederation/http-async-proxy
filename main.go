@@ -52,10 +52,10 @@ type ProxyServer struct {
     workerCount int
 
     // Prometheus metrics
-    totalRequests     prometheus.Counter
-    totalForwarded    prometheus.Counter
-    totalRetries      prometheus.Counter
-    totalFailed       prometheus.Counter
+    totalRequests     *prometheus.CounterVec
+    totalForwarded    *prometheus.CounterVec
+    totalRetries      *prometheus.CounterVec
+    totalFailed       *prometheus.CounterVec
     totalDropped      prometheus.Counter
     totalFailedBodyRead prometheus.Counter
     usedQueueLength     prometheus.Gauge
@@ -74,32 +74,44 @@ func NewProxyServer(configPath string, queueSize, workerCount int) *ProxyServer 
         queue:     make(chan *ForwardedRequest, queueSize), // Capped channel
         workerCount: workerCount,
         // Initialize Prometheus metrics
-        totalRequests: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_requests_total",
-            Help: "Total number of incoming requests",
-        }),
-        totalForwarded: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_forwarded_total",
-            Help: "Total number of successfully forwarded requests",
-        }),
-        totalRetries: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_retries_total",
-            Help: "Total number of retries",
-        }),
-        totalFailed: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_failed_total",
-            Help: "Total number of failed requests",
-        }),
+        totalRequests: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "pxfd_http_proxy_requests_total",
+                Help: "Total number of incoming requests",
+            },
+            []string{"host"},
+        ),
+        totalForwarded: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "pxfd_http_proxy_forwarded_total",
+                Help: "Total number of successfully forwarded requests",
+            },
+            []string{"host", "backend"},
+        ),
+        totalRetries: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "pxfd_http_proxy_retries_total",
+                Help: "Total number of retries",
+            },
+            []string{"host", "backend"},
+        ),
+        totalFailed: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "pxfd_http_proxy_failed_total",
+                Help: "Total number of failed requests",
+            },
+            []string{"host"},
+        ),
         totalDropped: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_dropped_total",
+            Name: "pxfd_http_proxy_dropped_total",
             Help: "Total number of dropped requests",
         }),
         totalFailedBodyRead: prometheus.NewCounter(prometheus.CounterOpts{
-            Name: "proxy_failed_body_read_total",
+            Name: "pxfd_http_proxy_failed_body_read_total",
             Help: "Total number of requests with failed body reads",
         }),
         usedQueueLength: prometheus.NewGauge(prometheus.GaugeOpts{
-            Name: "proxy_queue_length",
+            Name: "pxfd_http_proxy_queue_length",
             Help: "Current length of the request queue",
         }),
     }
@@ -252,15 +264,15 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
 
 // proxyRequest forwards the request to the backend with retries based on the configuration
 func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
-    // Increment total requests counter
-    p.totalRequests.Inc()
 
     host := r.Req.Host // The front-facing host
     host , _, _ = strings.Cut(host, ":") //strip port
     backends, found := p.getBackendsForHost(host)
 
+    p.totalRequests.WithLabelValues(host).Inc()
+
     if !found || len(backends) == 0 {
-        p.totalFailed.Inc() // Increment failed request counter
+        p.totalFailed.WithLabelValues(host).Inc() // Increment failed request counter
         log.Printf("Error host: '%v' not found in config file, droping request\n", host)
         return
     }
@@ -285,17 +297,17 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
             resp.Body.Close()
             if err == nil && resp.StatusCode < 400 {
                 // Successfully forwarded request
-                p.totalForwarded.Inc()
+                p.totalForwarded.WithLabelValues(host, backend.Backend).Inc()
                 return
             }
             lastErr = err
-            p.totalRetries.Inc()                         // Increment retries counter
+            p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
             time.Sleep(time.Duration(backend.Delay) * time.Second) // Small delay before retrying
         }
     }
 
     // If we get here, all backends failed
-    p.totalFailed.Inc() // Increment failed requests counter
+    p.totalFailed.WithLabelValues(host).Inc()
     log.Printf("All backends failed for host %s: %v\n", host, lastErr)
 }
 
