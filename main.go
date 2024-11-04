@@ -144,9 +144,9 @@ func NewProxyServer(configPath string, queueSize, workerCount int) *ProxyServer 
               klog.V(2).Infof("Got SIGQUIT signal")
               // deliver rest of queue to FINAL destination
             default:
-              klog.V(2).Infof("Some signal received: %v\n", sig)
+              klog.V(2).Infof("Some signal received: %v", sig)
           }
-          klog.V(1).Infof("Queue len is: %v\n", ps.getQueueLen())
+          klog.V(1).Infof("Queue len is: %v", ps.getQueueLen())
        }
     }()
 
@@ -162,12 +162,12 @@ func (p *ProxyServer) getQueueLen() int {
 func (p *ProxyServer) loadConfig() error {
     data, err := ioutil.ReadFile(p.configPath)
     if err != nil {
-        klog.Fatal("Error reading config file: %v\n", err)
+        klog.Fatal("Error reading config file: %v", err)
     }
 
     var newConfig Config
     if err := yaml.Unmarshal(data, &newConfig); err != nil {
-        klog.V(1).Infof("Error parsing config file: %v\n", err)
+        klog.V(1).Infof("Error parsing config file: %v", err)
         return err
     }
 
@@ -185,7 +185,7 @@ func (p *ProxyServer) loadConfig() error {
             }
         }
         if !found {
-            klog.V(2).Infof("Deleting old host %v\n", key)
+            klog.V(2).Infof("Deleting old host %v", key)
             p.config.Delete(key)
         }
         return true
@@ -214,7 +214,7 @@ func (p *ProxyServer) updateQueueLengthPeriodically() {
 
 // worker processes requests from the queue
 func (p *ProxyServer) worker(id int) {
-    klog.V(2).Infof("Worker %d started\n", id)
+    klog.V(2).Infof("Worker %d started", id)
     for req := range p.queue {
         p.proxyRequest(req) // Process each request from the queue
     }
@@ -268,7 +268,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
 
     if !found || len(backends) == 0 {
         p.totalFailed.WithLabelValues(host).Inc() // Increment failed request counter
-        klog.V(1).Infof("Error host: '%v' not found in config file, droping request\n", host)
+        klog.V(1).Infof("Error host: '%v' not found in config file, droping request", host)
         return
     }
 
@@ -278,7 +278,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
         for i := 0; i <= backend.Retries; i++ {
             req, err := http.NewRequest(r.Req.Method, backend.Backend+r.Req.URL.Path, bytes.NewReader(r.Body));
             if err != nil {
-                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v\n", host, err)
+                klog.V(4).Infof("Message failed for host %s with error: %v", backend.Backend, err)
                 lastErr = err
                 continue
             }
@@ -287,7 +287,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
             resp, err := client.Do(req)
             // Read the response body to ensure the connection can be reused
             if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-                klog.V(1).Infof("Failed to read %v response body: %v\n", backend.Backend +r.Req.URL.Path, err)
+                klog.V(1).Infof("Failed to read %v response body: %v", backend.Backend +r.Req.URL.Path, err)
             }
 
             resp.Body.Close()
@@ -296,7 +296,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
                 p.totalForwarded.WithLabelValues(host, backend.Backend).Inc()
                 return
             } else {
-                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v\n", host,resp.StatusCode, err)
+                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v", backend.Backend, resp.StatusCode, err)
             }
             lastErr = err
             p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
@@ -306,7 +306,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
 
     // If we get here, all backends failed
     p.totalFailed.WithLabelValues(host).Inc()
-    klog.V(1).Infof("All backends failed for host %s: %v\n", host, lastErr)
+    klog.V(1).Infof("All backends failed for host %s: %v", host, lastErr)
 }
 
 // handleIncomingRequest queues incoming requests
@@ -357,7 +357,7 @@ func main() {
     go func() {
         metricsMux := http.NewServeMux()
         metricsMux.Handle("/metrics", promhttp.Handler())
-        klog.V(1).Infof("Prometheus metrics server listening on %s\n", conf.MetricsAddress)
+        klog.V(1).Infof("Prometheus metrics server listening on %s", conf.MetricsAddress)
         err := http.ListenAndServe(conf.MetricsAddress, metricsMux)
         if err != nil {
             klog.Fatalf("Failed to start server: %v", err) // %v formats the error as a string
@@ -365,7 +365,7 @@ func main() {
     }()
 
     // Start the proxy server
-    klog.V(1).Infof("Proxy server is listening on %s\n", conf.ListenAddress)
+    klog.V(1).Infof("Proxy server is listening on %s", conf.ListenAddress)
     err = http.ListenAndServe(conf.ListenAddress, nil)
     if err != nil {
         klog.Fatalf("Failed to start server: %v", err) // %v formats the error as a string
