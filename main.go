@@ -1,11 +1,11 @@
 package main
 
 import (
+    "flag"
     "fmt"
     "bytes"
     "crypto/tls"
     "io/ioutil"
-    "log"
     "net"
     "net/http"
     "os"
@@ -22,6 +22,7 @@ import (
     "github.com/prometheus/client_golang/prometheus/promhttp"
 
     "github.com/jessevdk/go-flags"
+    "k8s.io/klog/v2"
 )
 
 type Opts struct {
@@ -30,6 +31,7 @@ type Opts struct {
     ListenAddress  string `long:"listen" short:"l" env:"LISTEN_ADDRESS" description:"listen bind address" default:":8080"`
     MetricsAddress string `long:"metrics_address" short:"m" env:"METRICS_ADDRESS" description:"metrics bind address" default:":9091"`
     ConfigPath     string `long:"config_path" short:"c" env:"CONFIG_PATH" description:"path to backend map file in yaml format" default:"/etc/backends.yaml"`
+    LogLevel       int    `long:"loglevel" short:"v" env:"LOG_LEVEL" description:"log verbosity level for klog" default:"2"`
 }
 
 // BackendConfig represents the configuration for each backend
@@ -134,17 +136,17 @@ func NewProxyServer(configPath string, queueSize, workerCount int) *ProxyServer 
         for sig := range signalCh {
           switch sig {
             case os.Interrupt:
-              log.Printf("Got interrput signal")
+              klog.V(2).Infof("Got interrput signal")
             case syscall.SIGTERM:
-              log.Printf("Got SIGTERM signal")
+              klog.V(2).Infof("Got SIGTERM signal")
               // deliver rest of queue to FINAL destination
             case syscall.SIGQUIT:
-              log.Printf("Got SIGQUIT signal")
+              klog.V(2).Infof("Got SIGQUIT signal")
               // deliver rest of queue to FINAL destination
             default:
-              log.Printf("Some signal received: %v\n", sig)
+              klog.V(2).Infof("Some signal received: %v\n", sig)
           }
-          log.Printf("Queue len is: %v\n", ps.getQueueLen())
+          klog.V(1).Infof("Queue len is: %v\n", ps.getQueueLen())
        }
     }()
 
@@ -160,12 +162,12 @@ func (p *ProxyServer) getQueueLen() int {
 func (p *ProxyServer) loadConfig() error {
     data, err := ioutil.ReadFile(p.configPath)
     if err != nil {
-        log.Fatal("Error reading config file: %v\n", err)
+        klog.Fatal("Error reading config file: %v\n", err)
     }
 
     var newConfig Config
     if err := yaml.Unmarshal(data, &newConfig); err != nil {
-        log.Printf("Error parsing config file: %v\n", err)
+        klog.V(1).Infof("Error parsing config file: %v\n", err)
         return err
     }
 
@@ -183,19 +185,12 @@ func (p *ProxyServer) loadConfig() error {
             }
         }
         if !found {
-            log.Printf("Deleting old host %v\n", key)
+            klog.V(2).Infof("Deleting old host %v\n", key)
             p.config.Delete(key)
         }
         return true
     })
-    /* Printf("New map:")
-    p.config.Range(func(key, value interface{}) bool {
-        log.Printf("%v\n", key)
-        log.Printf("%v\n", value)
-        return true
-    })
-    */
-    log.Println("Configuration reloaded successfully")
+    klog.V(4).Infof("Configuration reloaded successfully")
     return nil
 }
 
@@ -204,7 +199,7 @@ func (p *ProxyServer) reloadConfigPeriodically() {
     for {
         time.Sleep(30 * time.Second)
         if err := p.loadConfig(); err != nil {
-            log.Println("Failed to reload config:", err)
+            klog.V(1).Infof("Failed to reload config:", err)
         }
     }
 }
@@ -219,7 +214,7 @@ func (p *ProxyServer) updateQueueLengthPeriodically() {
 
 // worker processes requests from the queue
 func (p *ProxyServer) worker(id int) {
-    log.Printf("Worker %d started\n", id)
+    klog.V(2).Infof("Worker %d started\n", id)
     for req := range p.queue {
         p.proxyRequest(req) // Process each request from the queue
     }
@@ -273,7 +268,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
 
     if !found || len(backends) == 0 {
         p.totalFailed.WithLabelValues(host).Inc() // Increment failed request counter
-        log.Printf("Error host: '%v' not found in config file, droping request\n", host)
+        klog.V(1).Infof("Error host: '%v' not found in config file, droping request\n", host)
         return
     }
 
@@ -283,6 +278,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
         for i := 0; i <= backend.Retries; i++ {
             req, err := http.NewRequest(r.Req.Method, backend.Backend+r.Req.URL.Path, bytes.NewReader(r.Body));
             if err != nil {
+                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v\n", host, err)
                 lastErr = err
                 continue
             }
@@ -291,7 +287,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
             resp, err := client.Do(req)
             // Read the response body to ensure the connection can be reused
             if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-                log.Printf("Failed to read %v response body: %v\n", backend.Backend +r.Req.URL.Path, err)
+                klog.V(1).Infof("Failed to read %v response body: %v\n", backend.Backend +r.Req.URL.Path, err)
             }
 
             resp.Body.Close()
@@ -299,6 +295,8 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
                 // Successfully forwarded request
                 p.totalForwarded.WithLabelValues(host, backend.Backend).Inc()
                 return
+            } else {
+                klog.V(4).Infof("Message failed for host %s with resp code %v error: %v\n", host,resp.StatusCode, err)
             }
             lastErr = err
             p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
@@ -308,7 +306,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
 
     // If we get here, all backends failed
     p.totalFailed.WithLabelValues(host).Inc()
-    log.Printf("All backends failed for host %s: %v\n", host, lastErr)
+    klog.V(1).Infof("All backends failed for host %s: %v\n", host, lastErr)
 }
 
 // handleIncomingRequest queues incoming requests
@@ -340,11 +338,14 @@ func getEnv(key string, defaultValue string) string {
 }
 
 func main() {
+     klog.InitFlags(nil)
+
     var conf Opts
     _, err := flags.Parse(&conf)
     if err != nil {
-        log.Fatal(err)
+        klog.Fatalf("Error parsing flags: %v", err)
     }
+    flag.Set("v", fmt.Sprintf("%d", conf.LogLevel))
 
     // Create a new proxy server with the path to the YAML config
     proxy := NewProxyServer(conf.ConfigPath, conf.QueueSize, conf.WorkerCount) // queue size = 100, worker count = 5
@@ -356,11 +357,17 @@ func main() {
     go func() {
         metricsMux := http.NewServeMux()
         metricsMux.Handle("/metrics", promhttp.Handler())
-        log.Printf("Prometheus metrics server listening on %s\n", conf.MetricsAddress)
-        log.Fatal(http.ListenAndServe(conf.MetricsAddress, metricsMux))
+        klog.V(1).Infof("Prometheus metrics server listening on %s\n", conf.MetricsAddress)
+        err := http.ListenAndServe(conf.MetricsAddress, metricsMux)
+        if err != nil {
+            klog.Fatalf("Failed to start server: %v", err) // %v formats the error as a string
+        }
     }()
 
     // Start the proxy server
-    log.Printf("Proxy server is listening on %s\n", conf.ListenAddress)
-    log.Fatal(http.ListenAndServe(conf.ListenAddress, nil))
+    klog.V(1).Infof("Proxy server is listening on %s\n", conf.ListenAddress)
+    err = http.ListenAndServe(conf.ListenAddress, nil)
+    if err != nil {
+        klog.Fatalf("Failed to start server: %v", err) // %v formats the error as a string
+    }
 }
