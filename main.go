@@ -383,6 +383,8 @@ func main() {
     // Create a new proxy server with the path to the YAML config
     proxy := NewProxyServer(conf.ConfigPath, conf.QueueSize, conf.WorkerCount, conf.TerminateFile) // queue size = 100, worker count = 5
 
+    // Hadle healthz endpoint with automatic 200
+    http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {})
     // HTTP handler for incoming requests
     http.HandleFunc("/", proxy.handleIncomingRequest)
 
