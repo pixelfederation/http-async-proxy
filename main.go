@@ -12,6 +12,7 @@ import (
     "syscall"
     "os/signal"
     "sync"
+    "sync/atomic"
     "time"
     "strings"
     "io"
@@ -33,13 +34,21 @@ type Opts struct {
     ConfigPath     string `long:"config_path" short:"c" env:"CONFIG_PATH" description:"path to backend map file in yaml format" default:"/etc/backends.yaml"`
     LogLevel       int    `long:"loglevel" short:"v" env:"LOG_LEVEL" description:"log verbosity level for klog" default:"2"`
     TerminateFile  string `long:"terminate_file_path" short:"t" env:"TERMINATE_FILE_PATH" description:"if file exists will terminate" default:""`
+    DrainTimeout   float64 `long:"drain_timeout" env:"DRAIN_TIMEOUT" description:"max seconds to keep delivering queued requests after SIGTERM/terminate file" default:"15"`
+    DrainIdle      float64 `long:"drain_idle" env:"DRAIN_IDLE" description:"exit drain once queue is empty and no request arrived for this many seconds" default:"2"`
+}
+
+// seconds converts a float number of seconds from config into a time.Duration
+// (time.Duration(float) * time.Second truncates 0.2 to 0)
+func seconds(s float64) time.Duration {
+    return time.Duration(s * float64(time.Second))
 }
 
 // BackendConfig represents the configuration for each backend
 type BackendConfig struct {
     Backend string  `yaml:"backend"`
     Retries int     `yaml:"retries"`
-    Delay   float32 `yaml:"delay`
+    Delay   float32 `yaml:"delay"`
     Timeout float32 `yaml:"timeout"` // Timeout in seconds
 }
 
@@ -53,6 +62,12 @@ type ProxyServer struct {
     clients   sync.Map
     queue     chan *ForwardedRequest // Capped channel acting as the request queue
     workerCount int
+
+    drainTimeout time.Duration
+    drainIdle    time.Duration
+    drainOnce    sync.Once
+    lastEnqueue  atomic.Int64 // unix nanos of the last queued request
+    inFlight     atomic.Int64 // requests taken from the queue and not finished yet
 
     // Prometheus metrics
     totalRequests     *prometheus.CounterVec
@@ -71,11 +86,13 @@ type ForwardedRequest struct {
 }
 
 // NewProxyServer initializes a new ProxyServer with Prometheus metrics and worker goroutines
-func NewProxyServer(configPath string, queueSize, workerCount int, terminateFile string) *ProxyServer {
+func NewProxyServer(configPath string, queueSize, workerCount int, terminateFile string, drainTimeout, drainIdle time.Duration) *ProxyServer {
     ps := &ProxyServer{
         configPath:  configPath,
         queue:     make(chan *ForwardedRequest, queueSize), // Capped channel
         workerCount: workerCount,
+        drainTimeout: drainTimeout,
+        drainIdle:    drainIdle,
         // Initialize Prometheus metrics
         totalRequests: prometheus.NewCounterVec(
             prometheus.CounterOpts{
@@ -134,23 +151,16 @@ func NewProxyServer(configPath string, queueSize, workerCount int, terminateFile
         go ps.worker(i)
     }
 
-    signalCh := make(chan os.Signal)
+    signalCh := make(chan os.Signal, 1)
     signal.Notify(signalCh, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
     go func() {
         for sig := range signalCh {
-          switch sig {
-            case os.Interrupt:
-              klog.V(2).Infof("Got interrput signal")
-            case syscall.SIGTERM:
-              klog.V(2).Infof("Got SIGTERM signal")
-              // deliver rest of queue to FINAL destination
-            case syscall.SIGQUIT:
-              klog.V(2).Infof("Got SIGQUIT signal")
-              // deliver rest of queue to FINAL destination
-            default:
-              klog.V(2).Infof("Some signal received: %v", sig)
+          klog.V(1).Infof("Got signal %v, queue len is: %v", sig, ps.getQueueLen())
+          if sig == syscall.SIGHUP {
+              continue
           }
-          klog.V(1).Infof("Queue len is: %v", ps.getQueueLen())
+          // deliver rest of queue before exiting
+          go ps.drainAndExit(fmt.Sprintf("signal %v", sig))
        }
     }()
 
@@ -166,7 +176,7 @@ func (p *ProxyServer) getQueueLen() int {
 func (p *ProxyServer) loadConfig() error {
     data, err := ioutil.ReadFile(p.configPath)
     if err != nil {
-        klog.Fatal("Error reading config file: %v", err)
+        klog.Fatalf("Error reading config file: %v", err)
     }
 
     var newConfig Config
@@ -203,7 +213,7 @@ func (p *ProxyServer) reloadConfigPeriodically() {
     for {
         time.Sleep(30 * time.Second)
         if err := p.loadConfig(); err != nil {
-            klog.V(1).Infof("Failed to reload config:", err)
+            klog.V(1).Infof("Failed to reload config: %v", err)
         }
     }
 }
@@ -211,11 +221,35 @@ func (p *ProxyServer) reloadConfigPeriodically() {
 func (p *ProxyServer) checkTerminateFile(terminateFile string) {
     for {
         if _, err := os.Stat(terminateFile); err == nil {
-            klog.V(1).Infof("File exists %s - terminating",terminateFile)
-            os.Exit(0)
+            klog.V(1).Infof("File exists %s - terminating", terminateFile)
+            p.drainAndExit("terminate file")
+            return
         }
         time.Sleep(5 * time.Second)
     }
+}
+
+// drainAndExit keeps accepting and delivering requests until the queue is empty
+// and nothing new arrived for drainIdle (the app may still be sending while it
+// shuts down), or until drainTimeout passes, then exits the process.
+func (p *ProxyServer) drainAndExit(reason string) {
+    p.drainOnce.Do(func() {
+        klog.V(1).Infof("Draining on %s: queue len %d, timeout %v", reason, p.getQueueLen(), p.drainTimeout)
+        deadline := time.Now().Add(p.drainTimeout)
+        for time.Now().Before(deadline) {
+            idleFor := time.Since(time.Unix(0, p.lastEnqueue.Load()))
+            if p.getQueueLen() == 0 && p.inFlight.Load() == 0 && idleFor >= p.drainIdle {
+                klog.V(1).Infof("Queue drained, exiting")
+                klog.Flush()
+                os.Exit(0)
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+        klog.Errorf("Drain timeout after %v, exiting with %d queued and %d in flight requests undelivered", p.drainTimeout, p.getQueueLen(), p.inFlight.Load())
+        klog.Flush()
+        // exit 0 anyway: a failing sidecar must not fail the pod/Job
+        os.Exit(0)
+    })
 }
 
 // updateQueueLengthPeriodically updates the queue length every 10 seconds
@@ -230,7 +264,9 @@ func (p *ProxyServer) updateQueueLengthPeriodically() {
 func (p *ProxyServer) worker(id int) {
     klog.V(2).Infof("Worker %d started", id)
     for req := range p.queue {
+        p.inFlight.Add(1)
         p.proxyRequest(req) // Process each request from the queue
+        p.inFlight.Add(-1)
     }
 }
 
@@ -254,7 +290,7 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
         // redirects, and reading the response body. The timer remains
         // running after Get, Head, Post, or Do return and will
         // interrupt reading of the Response.Body.
-        Timeout: (time.Duration(timeout) + 1) * time.Second,
+        Timeout: seconds(float64(timeout)),
         Transport: &http.Transport{
             MaxIdleConns:      100,
             IdleConnTimeout:     90 * time.Second,
@@ -263,7 +299,7 @@ func (p *ProxyServer) getClientForHost(hostBackend string, timeout float32) (*ht
             DialContext: (&net.Dialer{
                 //    Timeout is the maximum amount of time a dial will wait for
                 // a connect to complete.
-                Timeout: time.Duration(timeout) * time.Second,
+                Timeout: seconds(float64(timeout)),
             }).DialContext,
         },
     }
@@ -314,7 +350,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
                 klog.V(1).Infof("Failed to process request to %s with error: %v", backend.Backend, err)
                 lastErr = err
                 p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
-                time.Sleep(time.Duration(backend.Delay) * time.Second)
+                time.Sleep(seconds(float64(backend.Delay)))
                 continue
             }
 
@@ -332,7 +368,7 @@ func (p *ProxyServer) proxyRequest(r *ForwardedRequest) {
             } else {
                 klog.V(4).Infof("Request to %s failed on not acceptable status code %v", backend.Backend, resp.StatusCode)
                 p.totalRetries.WithLabelValues(host, backend.Backend).Inc()
-                time.Sleep(time.Duration(backend.Delay) * time.Second)
+                time.Sleep(seconds(float64(backend.Delay)))
                 continue
             }
         }
@@ -352,6 +388,10 @@ func (p *ProxyServer) handleIncomingRequest(w http.ResponseWriter, r *http.Reque
         return
     }
     r.Body.Close() // Close the original body
+
+    // Mark activity before queueing so a drain never sees an empty queue
+    // and idle time while a worker is just picking this request up
+    p.lastEnqueue.Store(time.Now().UnixNano())
 
     // Try to add the request to the queue
     select {
@@ -381,7 +421,7 @@ func main() {
     flag.Set("v", fmt.Sprintf("%d", conf.LogLevel))
 
     // Create a new proxy server with the path to the YAML config
-    proxy := NewProxyServer(conf.ConfigPath, conf.QueueSize, conf.WorkerCount, conf.TerminateFile) // queue size = 100, worker count = 5
+    proxy := NewProxyServer(conf.ConfigPath, conf.QueueSize, conf.WorkerCount, conf.TerminateFile, seconds(conf.DrainTimeout), seconds(conf.DrainIdle))
 
     // Hadle healthz endpoint with automatic 200
     http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {})
