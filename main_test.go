@@ -27,7 +27,10 @@ func newTestProxy(t *testing.T, backend BackendConfig) *ProxyServer {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return NewProxyServer(path, 100, 2, prometheus.NewRegistry())
+	p := NewProxyServer(path, 100, 2, prometheus.NewRegistry())
+	// cleanups run in reverse order: stop the reloader before TempDir removes its config
+	t.Cleanup(p.drain)
+	return p
 }
 
 func forward(p *ProxyServer) {

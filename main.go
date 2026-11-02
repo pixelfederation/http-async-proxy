@@ -62,6 +62,9 @@ type ProxyServer struct {
     queue     chan *ForwardedRequest // Capped channel acting as the request queue
     workerCount int
     workers     sync.WaitGroup
+    stop        chan struct{}  // closed by drain, ends the background loops
+    loops       sync.WaitGroup // background loops (config reload, queue gauge)
+    drainOnce   sync.Once
 
     // Prometheus metrics
     totalRequests     *prometheus.CounterVec
@@ -85,6 +88,7 @@ func NewProxyServer(configPath string, queueSize, workerCount int, reg prometheu
         configPath:  configPath,
         queue:     make(chan *ForwardedRequest, queueSize), // Capped channel
         workerCount: workerCount,
+        stop:        make(chan struct{}),
         // Initialize Prometheus metrics
         totalRequests: prometheus.NewCounterVec(
             prometheus.CounterOpts{
@@ -132,6 +136,7 @@ func NewProxyServer(configPath string, queueSize, workerCount int, reg prometheu
     reg.MustRegister(ps.totalRequests, ps.totalForwarded, ps.totalRetries, ps.totalFailed, ps.totalDropped, ps.totalFailedBodyRead, ps.usedQueueLength)
 
     ps.loadConfig()                 // Load config initially
+    ps.loops.Add(2)
     go ps.reloadConfigPeriodically()    // Start goroutine to reload config every 30 seconds
     go ps.updateQueueLengthPeriodically() // Start goroutine to update queue length metrics
 
@@ -187,10 +192,17 @@ func (p *ProxyServer) loadConfig() error {
 
 // reloadConfigPeriodically reloads the config from the file every 30 seconds
 func (p *ProxyServer) reloadConfigPeriodically() {
+    defer p.loops.Done()
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
     for {
-        time.Sleep(30 * time.Second)
-        if err := p.loadConfig(); err != nil {
-            klog.V(1).Infof("Failed to reload config: %v", err)
+        select {
+        case <-p.stop:
+            return
+        case <-ticker.C:
+            if err := p.loadConfig(); err != nil {
+                klog.V(1).Infof("Failed to reload config: %v", err)
+            }
         }
     }
 }
@@ -215,15 +227,32 @@ func (p *ProxyServer) shutdown(srv *http.Server) {
     if err := srv.Shutdown(context.Background()); err != nil {
         klog.Errorf("Failed to stop server: %v", err)
     }
-    close(p.queue)
-    p.workers.Wait()
+    p.drain()
+}
+
+// drain delivers what is queued, then stops the workers and background loops.
+// Nothing may send to the queue afterwards. Safe to call more than once.
+func (p *ProxyServer) drain() {
+    p.drainOnce.Do(func() {
+        close(p.queue)
+        p.workers.Wait()
+        close(p.stop)
+        p.loops.Wait()
+    })
 }
 
 // updateQueueLengthPeriodically updates the queue length every 10 seconds
 func (p *ProxyServer) updateQueueLengthPeriodically() {
+    defer p.loops.Done()
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
     for {
         p.usedQueueLength.Set(float64(len(p.queue))) // Update queue length gauge
-        time.Sleep(10 * time.Second)
+        select {
+        case <-p.stop:
+            return
+        case <-ticker.C:
+        }
     }
 }
 
